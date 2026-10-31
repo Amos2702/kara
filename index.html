@@ -109,7 +109,7 @@ aside h2{margin:0 0 10px;font-size:18px;display:flex;justify-content:space-betwe
       <div class="addbar">
         <input id="urlIn" type="text" placeholder="Paste a YouTube link here" autocomplete="off" autocapitalize="off">
         <button id="addBtn" class="primary">Add song</button>
-        <button id="importBtn">📁 Import MP4</button>
+        <button id="importBtn">📁 Import video / music</button>
         <input id="fileIn" type="file" accept="video/*,audio/*" multiple class="hidden">
         <input id="mp3In" type="file" accept="audio/*" class="hidden">
       </div>
@@ -294,14 +294,14 @@ function songRow(s, ctx) {
     : `<button class="icon" data-act="sing" data-id="${s.id}" title="Sing now">▶</button>
        <button class="icon" data-act="q" data-id="${s.id}" title="Add to queue">＋</button>
        <button class="icon fav ${s.fav ? 'on' : ''}" data-act="fav" data-id="${s.id}" title="Favorite">${s.fav ? '★' : '☆'}</button>
-       ${s.type === 'yt' ? (s.mp3
+       ${(s.mp3
          ? `<button data-act="unmp3" data-id="${s.id}" title="Unlink MP3">🎵✕</button>`
-         : `<button data-act="mp3" data-id="${s.id}" title="Use my MP3 as the sound">🎵＋</button>`) : ''}
+         : `<button data-act="mp3" data-id="${s.id}" title="Use my MP3 as the sound">🎵＋</button>`)}
        ${pls}
        <button class="icon" data-act="edit" data-id="${s.id}" title="Rename">✎</button>
        ${del}`;
   return `<div class="song">${thumb}<div class="info"><div class="title">${title}</div>
-    <div class="meta">${s.type === 'yt' ? 'YouTube' + (s.mp3 ? ' + 🎵 ' + esc(s.mp3) : '') : 'File · ' + esc(s.file || '')}${s.bad ? ' · ⚠ can\'t play here' : ''}</div></div>
+    <div class="meta">${s.type === 'yt' ? 'YouTube' + (s.mp3 ? ' + 🎵 ' + esc(s.mp3) : '') : 'File · ' + esc(s.file || '') + (s.mp3 ? ' + 🎵 ' + esc(s.mp3) : '')}${s.bad ? ' · ⚠ can\'t play here' : ''}</div></div>
     <div class="acts">${acts}</div></div>`;
 }
 function renderLib() {
@@ -445,11 +445,19 @@ async function playSong(id) {
     setPaired(false);
     $('#ytWrap').classList.add('hidden'); vid.classList.remove('hidden'); mode = 'file';
     $('#cVocal').disabled = false;
-    let blob = null; try { blob = await getFile(id); } catch (e) {}
+    let blob = null, mp3 = null; try { blob = await getFile(id); } catch (e) {}
     if (!blob) { showErr('This file is missing. Please import it again. Skipping…'); setTimeout(next, 3500); return; }
+    if (s.mp3) { try { mp3 = await getFile('aud:' + id); } catch (e) {} }
+    if (nowId !== id) return;
+    if (s.mp3 && !mp3) showErr('The linked MP3 is missing, so the video sound is used. Link it again from the Library.');
     if (objUrl) URL.revokeObjectURL(objUrl);
     objUrl = URL.createObjectURL(blob); vid.src = objUrl;
-    routeFrom(vid);
+    vid.muted = !!mp3;
+    if (mp3) {
+      if (audUrl) URL.revokeObjectURL(audUrl);
+      audUrl = URL.createObjectURL(mp3); aud.src = audUrl;
+    }
+    setPaired(!!mp3); routeFrom(mp3 ? aud : vid);
     vid.play().catch(() => setPlayIcon(false));
   }
   flashBanner('Now singing', s.title);
@@ -487,8 +495,11 @@ function setPaired(on) {
   $('#cVocal').disabled = !on && mode !== 'file';
 }
 function syncAud() {
-  if (!paired || !ytReady || yt.getPlayerState() !== YT.PlayerState.PLAYING) return;
-  const s = song(nowId), target = yt.getCurrentTime() + ((s && s.offset) || 0);
+  if (!paired) return;
+  // the video (YouTube or an imported file) is the clock the MP3 follows
+  const playing = mode === 'yt' ? ytReady && yt.getPlayerState() === YT.PlayerState.PLAYING : !vid.paused;
+  if (!playing) return;
+  const s = song(nowId), target = (mode === 'yt' ? yt.getCurrentTime() : vid.currentTime) + ((s && s.offset) || 0);
   if (target < 0 || (aud.duration && target >= aud.duration)) { aud.pause(); return; }
   if (Math.abs(aud.currentTime - target) > 0.25) aud.currentTime = target;
   if (aud.paused) aud.play().catch(() => flashBanner('Tap ▶', 'to start your MP3'));
@@ -506,8 +517,9 @@ document.addEventListener('click', () => {
 }, true);
 function setPlayIcon(playing) { $('#cPlay').textContent = playing ? '⏸' : '▶'; }
 vid.addEventListener('ended', next);
-vid.addEventListener('play', () => setPlayIcon(true));
-vid.addEventListener('pause', () => setPlayIcon(false));
+vid.addEventListener('play', () => { setPlayIcon(true); if (paired) syncAud(); });
+vid.addEventListener('pause', () => { setPlayIcon(false); if (paired) aud.pause(); });
+vid.addEventListener('seeked', () => { if (paired) syncAud(); });
 
 function updateInfo() {
   const s = song(nowId), n = song(S.queue[0]);
