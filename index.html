@@ -111,6 +111,7 @@ aside h2{margin:0 0 10px;font-size:18px;display:flex;justify-content:space-betwe
         <button id="addBtn" class="primary">Add song</button>
         <button id="importBtn">📁 Import MP4</button>
         <input id="fileIn" type="file" accept="video/*,audio/*" multiple class="hidden">
+        <input id="mp3In" type="file" accept="audio/*" class="hidden">
       </div>
       <div id="addMsg" class="msg"></div>
       <div class="filterbar">
@@ -152,6 +153,7 @@ aside h2{margin:0 0 10px;font-size:18px;display:flex;justify-content:space-betwe
   <div id="idle"><h2>🎤 Karaoke <span>Night</span></h2><p>Add songs to the queue, then press ▶</p></div>
   <div id="ytWrap" class="hidden"><div id="yt"></div></div>
   <video id="vid" class="hidden" playsinline></video>
+  <audio id="aud" playsinline></audio>
   <div id="tapCatch"></div>
   <div id="topInfo"><div class="now" id="nowT"></div><div class="next" id="nextT"></div></div>
   <div id="banner" style="opacity:0"></div>
@@ -161,7 +163,9 @@ aside h2{margin:0 0 10px;font-size:18px;display:flex;justify-content:space-betwe
     <button id="cRestart" title="Restart song">⏮</button>
     <button id="cPlay" title="Play / pause">▶</button>
     <button id="cSkip" title="Next song">⏭</button>
-    <select id="cVocal" title="Vocals (MP4 only)">
+    <button id="cEarly" class="hidden" title="Music half a second sooner">🎵 sooner</button>
+    <button id="cLate" class="hidden" title="Music half a second later">🎵 later</button>
+    <select id="cVocal" title="Vocals (your own files only)">
       <option value="stereo">🎵 Normal</option>
       <option value="reduce">🎤 Reduce vocals</option>
       <option value="left">◀ Left channel</option>
@@ -267,6 +271,7 @@ async function removeSong(id) {
   S.playlists.forEach(p => p.songs = p.songs.filter(x => x !== id));
   S.queue = S.queue.filter(x => x !== id);
   if (s.type === 'file') delFile(id).catch(() => {});
+  if (s.mp3) delFile('aud:' + id).catch(() => {});
   save(); renderAll();
 }
 let favOnly = false, editing = null, confirmDel = null;
@@ -289,11 +294,14 @@ function songRow(s, ctx) {
     : `<button class="icon" data-act="sing" data-id="${s.id}" title="Sing now">▶</button>
        <button class="icon" data-act="q" data-id="${s.id}" title="Add to queue">＋</button>
        <button class="icon fav ${s.fav ? 'on' : ''}" data-act="fav" data-id="${s.id}" title="Favorite">${s.fav ? '★' : '☆'}</button>
+       ${s.type === 'yt' ? (s.mp3
+         ? `<button data-act="unmp3" data-id="${s.id}" title="Unlink MP3">🎵✕</button>`
+         : `<button data-act="mp3" data-id="${s.id}" title="Use my MP3 as the sound">🎵＋</button>`) : ''}
        ${pls}
        <button class="icon" data-act="edit" data-id="${s.id}" title="Rename">✎</button>
        ${del}`;
   return `<div class="song">${thumb}<div class="info"><div class="title">${title}</div>
-    <div class="meta">${s.type === 'yt' ? 'YouTube' : 'MP4 · ' + esc(s.file || '')}${s.bad ? ' · ⚠ can\'t play here' : ''}</div></div>
+    <div class="meta">${s.type === 'yt' ? 'YouTube' + (s.mp3 ? ' + 🎵 ' + esc(s.mp3) : '') : 'File · ' + esc(s.file || '')}${s.bad ? ' · ⚠ can\'t play here' : ''}</div></div>
     <div class="acts">${acts}</div></div>`;
 }
 function renderLib() {
@@ -344,10 +352,11 @@ window.onYouTubeIframeAPIReady = () => {
     width: '100%', height: '100%',
     playerVars: { playsinline: 1, rel: 0, modestbranding: 1, fs: 0 },
     events: {
-      onReady: () => { ytReady = true; if (pendingYT) { yt.loadVideoById(pendingYT); pendingYT = null; } },
+      onReady: () => { ytReady = true; if (pendingYT) { paired ? yt.mute() : yt.unMute(); yt.loadVideoById(pendingYT); pendingYT = null; } },
       onStateChange: e => {
         if (e.data === YT.PlayerState.ENDED) next();
         if (e.data === YT.PlayerState.PLAYING) { $('#tapCatch').style.pointerEvents = ''; }
+        if (paired) e.data === YT.PlayerState.PLAYING ? syncAud() : aud.pause();
         setPlayIcon(e.data === YT.PlayerState.PLAYING);
       },
       onError: e => {
@@ -369,6 +378,13 @@ function loadYTApi() {
 
 // Web Audio graph for MP4s: lets us pick a channel or cancel centre-panned vocals
 let actx = null, srcNode = null, nodes = [];
+const srcFor = new Map();   // createMediaElementSource may only be called once per element
+function routeFrom(el) {
+  audioCtx();
+  if (!srcFor.has(el)) srcFor.set(el, actx.createMediaElementSource(el));
+  if (srcNode && srcNode !== srcFor.get(el)) srcNode.disconnect();
+  srcNode = srcFor.get(el); applyVocal();
+}
 function audioCtx() {
   if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
   if (actx.state === 'suspended') actx.resume();
@@ -406,8 +422,15 @@ async function playSong(id) {
   $('#idle').classList.add('hidden');
   if (s.type === 'yt') {
     vid.pause(); vid.classList.add('hidden'); $('#ytWrap').classList.remove('hidden'); mode = 'yt';
-    $('#cVocal').disabled = true;
-    if (ytReady) yt.loadVideoById(s.yt); else { pendingYT = s.yt; loadYTApi(); }
+    let blob = null;
+    if (s.mp3) { try { blob = await getFile('aud:' + id); } catch (e) {} }
+    if (nowId !== id) return;
+    setPaired(!!blob);
+    if (blob) {
+      if (audUrl) URL.revokeObjectURL(audUrl);
+      audUrl = URL.createObjectURL(blob); aud.src = audUrl; routeFrom(aud);
+    } else if (s.mp3) showErr('The linked MP3 is missing, so the video sound is used. Link it again from the Library.');
+    if (ytReady) { blob ? yt.mute() : yt.unMute(); yt.loadVideoById(s.yt); } else { pendingYT = s.yt; loadYTApi(); }
     // iPad Safari sometimes refuses to start a video with sound on its own;
     // if so, let taps through to YouTube's own play button
     setTimeout(() => {
@@ -419,14 +442,14 @@ async function playSong(id) {
     }, 3000);
   } else {
     if (ytReady) yt.stopVideo();
+    setPaired(false);
     $('#ytWrap').classList.add('hidden'); vid.classList.remove('hidden'); mode = 'file';
     $('#cVocal').disabled = false;
     let blob = null; try { blob = await getFile(id); } catch (e) {}
     if (!blob) { showErr('This file is missing. Please import it again. Skipping…'); setTimeout(next, 3500); return; }
     if (objUrl) URL.revokeObjectURL(objUrl);
     objUrl = URL.createObjectURL(blob); vid.src = objUrl;
-    audioCtx();
-    if (!srcNode) { srcNode = actx.createMediaElementSource(vid); applyVocal(); }
+    routeFrom(vid);
     vid.play().catch(() => setPlayIcon(false));
   }
   flashBanner('Now singing', s.title);
@@ -436,19 +459,51 @@ function next() {
   const id = S.queue.shift(); save();
   if (id) return playSong(id);
   nowId = null; mode = null; renderQ();
-  if (ytReady) yt.stopVideo(); vid.pause();
+  if (ytReady) yt.stopVideo(); vid.pause(); setPaired(false);
   $('#ytWrap').classList.add('hidden'); vid.classList.add('hidden'); $('#idle').classList.remove('hidden');
   setPlayIcon(false); wake();
 }
 function togglePlay() {
   if (!mode) { if (S.queue.length) next(); return; }
-  if (mode === 'yt' && ytReady) yt.getPlayerState() === YT.PlayerState.PLAYING ? yt.pauseVideo() : yt.playVideo();
+  if (mode === 'yt' && ytReady) {
+    if (yt.getPlayerState() === YT.PlayerState.PLAYING) { yt.pauseVideo(); if (paired) aud.pause(); }
+    else { yt.playVideo(); if (paired) { audioCtx(); aud.play().catch(() => {}); } }
+  }
   if (mode === 'file') { audioCtx(); vid.paused ? vid.play() : vid.pause(); }
 }
 function restart() {
   if (mode === 'yt' && ytReady) yt.seekTo(0, true);
   if (mode === 'file') vid.currentTime = 0;
 }
+// A YouTube video "married" to the user's MP3: YouTube is muted and only provides the picture,
+// the MP3 follows YouTube's clock. offset = seconds the MP3 runs ahead of the video.
+let paired = false, audUrl = null, syncT = null;
+const aud = $('#aud');
+function setPaired(on) {
+  paired = on;
+  if (!on) { aud.pause(); clearInterval(syncT); syncT = null; }
+  else if (!syncT) syncT = setInterval(syncAud, 1000);
+  $('#cEarly').classList.toggle('hidden', !on); $('#cLate').classList.toggle('hidden', !on);
+  $('#cVocal').disabled = !on && mode !== 'file';
+}
+function syncAud() {
+  if (!paired || !ytReady || yt.getPlayerState() !== YT.PlayerState.PLAYING) return;
+  const s = song(nowId), target = yt.getCurrentTime() + ((s && s.offset) || 0);
+  if (target < 0 || (aud.duration && target >= aud.duration)) { aud.pause(); return; }
+  if (Math.abs(aud.currentTime - target) > 0.25) aud.currentTime = target;
+  if (aud.paused) aud.play().catch(() => flashBanner('Tap ▶', 'to start your MP3'));
+}
+function nudge(d) {
+  const s = song(nowId); if (!s || !paired) return;
+  s.offset = Math.round((((s.offset || 0) + d)) * 10) / 10; save(); syncAud();
+  flashBanner('MP3 sync', (s.offset > 0 ? '+' : '') + s.offset.toFixed(1) + 's');
+}
+// iPad only lets a media element start by itself once it has been started by a tap
+let unlocked = false;
+document.addEventListener('click', () => {
+  if (unlocked) return; unlocked = true; audioCtx();
+  if (!aud.src) { aud.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA='; aud.play().then(() => aud.pause()).catch(() => {}); }
+}, true);
 function setPlayIcon(playing) { $('#cPlay').textContent = playing ? '⏸' : '▶'; }
 vid.addEventListener('ended', next);
 vid.addEventListener('play', () => setPlayIcon(true));
@@ -545,6 +600,13 @@ $('#addBtn').onclick = addYT;
 $('#urlIn').addEventListener('keydown', e => { if (e.key === 'Enter') addYT(); });
 $('#importBtn').onclick = () => $('#fileIn').click();
 $('#fileIn').onchange = e => { importFiles([...e.target.files]); e.target.value = ''; };
+let mp3For = null;
+$('#mp3In').onchange = async e => {
+  const f = e.target.files[0], s = song(mp3For); e.target.value = '';
+  if (!f || !s) return;
+  try { await putFile('aud:' + s.id, f); } catch (err) { return msg('Could not save ' + f.name + '. The iPad may be out of space.', true); }
+  s.mp3 = f.name; s.offset = 0; save(); renderLib(); msg('Linked ' + f.name + ' to ' + s.title + '.');
+};
 $('#searchIn').oninput = renderLib;
 $('#favOnly').onclick = () => { favOnly = !favOnly; renderLib(); };
 
@@ -559,6 +621,8 @@ document.querySelector('main').addEventListener('click', e => {
   else if (act === 'edit') { editing = id; renderLib(); }
   else if (act === 'askdel') { confirmDel = id; renderLib(); }
   else if (act === 'del') { confirmDel = null; removeSong(id); }
+  else if (act === 'mp3') { mp3For = id; $('#mp3In').click(); }
+  else if (act === 'unmp3') { delFile('aud:' + id).catch(() => {}); delete s.mp3; delete s.offset; save(); renderLib(); }
   else if (act === 'plrm') { const p = S.playlists.find(p => p.id === curPl); p.songs = p.songs.filter(x => x !== id); save(); renderPl(); }
 });
 document.querySelector('main').addEventListener('change', e => {
@@ -622,6 +686,8 @@ $('#cSkip').onclick = next;
 $('#cRestart').onclick = restart;
 $('#cClap').onclick = applause;
 $('#cHorn').onclick = horn;
+$('#cEarly').onclick = () => nudge(0.5);
+$('#cLate').onclick = () => nudge(-0.5);
 $('#cVocal').value = S.vocal;
 $('#cVocal').onchange = e => { S.vocal = e.target.value; save(); applyVocal(); };
 
